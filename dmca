@@ -1,0 +1,718 @@
+#!/usr/bin/env bash
+
+# dmca
+# Digital Millenium Copyright Act Notice Identification Simplification
+# Nick Martin, Summer 2017
+
+
+################################################################################
+# Support Function, printed if -h or help is one of the arguments
+################################################################################
+support() {
+    echo "USAGE:        dmca.sh [OPTIONS]"
+    echo
+    echo "OPTIONS:"
+    echo "  -date       Date of Incident (YYYY/MM/DD)"
+    echo "  -time       Time of Incident (HH:MM:SS)"
+    echo "  -ip         External IP Address (DDD.DDD.DDD.DDD)"
+    echo "  -port       External Port Number"
+    echo
+    echo "  -clear      Clear any logs for this given incident"
+    echo
+    echo "  -help       Show this help text"
+    echo
+    echo "Script must be executed in subshell, either using"
+    echo "  'dmca' OR './dmca'"
+    echo
+    exit 0
+}
+
+
+################################################################################
+# Relative Directories/Paths/Filenames/URLs
+################################################################################
+BACKUP_LOGDIR=~/.dmca_backups
+LOGDIR=""
+PA_LOGDIR="";    PA_CURRLOG=""
+DHCP_LOGDIR="";     DHCP_CURRLOG=""
+VPN_LOGDIR="";       VPN_CURRLOG=""
+RESNET_URL=""
+CISCOPRIME_URL=""
+
+
+################################################################################
+# Function to print/return the formatting required to obtain a text color/style
+#
+# Args:
+#   $1                  the text representation of the color or style
+################################################################################
+color() {
+    case "$1" in
+        bold)     echo "$(tput bold)";;
+        ul_on)    echo "$(tput smul)";;
+        ul_off)   echo "$(tput rmul)";;
+        red)      echo "$(tput bold)$(tput setaf 1)";;
+        green)    echo "$(tput bold)$(tput setaf 2)";;
+        yellow)   echo "$(tput bold)$(tput setaf 3)";;
+        blue)     echo "$(tput bold)$(tput setaf 4)";;
+        magenta)  echo "$(tput bold)$(tput setaf 5)";;
+        cyan)     echo "$(tput bold)$(tput setaf 6)";;
+        white)    echo "$(tput bold)$(tput setaf 7)";;
+        reset|*)  echo "$(tput sgr0)$(tput setaf 7)";;
+    esac
+}
+
+
+################################################################################
+# Function to print a prompt for various situations
+#   *none               a general yellow text printout
+#   notify              a general notification
+#   status              a key/value pair
+#   input               a prompt followed by an entry for user-input
+#   error               notification an error was detected
+#   exit                notification an error was detected, with exit code
+#   line                prints a divider between sections
+#
+# Args:
+#   $1                  either the string to print, or the style for the prompt
+#   $2*                 the string to print if a style is used
+#   $3*                 the exit code, variable to set, or second value to print
+################################################################################
+prompt() {
+    if [[ $# = 1 ]]; then
+        case "$1" in
+            line)
+                line=$(printf "%-$(tput cols)s" "=")
+                echo -e "\n$(color yellow)${line// /=}$(color reset)\n"
+                ;;
+            *)
+                echo -e "$(color yellow)${1}$(color reset)\n"
+                ;;
+        esac
+    else
+        local sub_val=""
+        local exit_val=""
+        local ret_var=""
+        local b1="$(color white)["
+        local b2="$(color white)]"
+        case "$1" in
+            notify) sym="${b1}$(color green)-${b2}";;
+            error)  sym="${b1}$(color red)!${b2}";;
+            status) sym="${b1}$(color green)+${b2}";    sub_val="$3";;
+            exit)   sym="${b1}$(color red)!${b2}";      exit_val="$3";;
+            input)  sym="${b1}$(color yellow)?${b2}";   ret_var="$3";;
+        esac
+
+        local str="  ${sym} $(color bold)${2}$(color reset)"
+        [[ -n "$sub_val" ]] && str="${str}${sub_val}$(color reset)"
+
+        case "$1" in
+            input)  read -p "$(echo -e "$str")" ${ret_var};;
+            exit)   echo -e "$str"; exit $exit_val;;
+            *)      echo -e "$str";;
+        esac
+    fi
+}
+
+
+################################################################################
+# Timer Function, prints the total time when end argument is issued
+#
+# Args:
+#   $1                      'start' or 'end'
+# Values Set:
+#   timer_start             current epoch seconds when timer was started
+################################################################################
+timer() {
+    local seconds=$(date "+%s")
+    case "$1" in
+        start)
+            timer_start=$seconds
+            ;;
+        end)
+            local total=$(date "+%-Mm, %-Ss" -u -d@"$((seconds - timer_start))")
+            prompt status "Completed in: " "\t\t${total}"
+            ;;
+    esac
+}
+
+
+################################################################################
+# Print the Intro Banner, and prompt for event details if not supplied
+#   when the script was executed by command line arguments.
+#
+# Values Set:
+#   IP
+#   PORT
+#   TIME
+#   DATE
+#   HOSTNAME                hostname associated to the supplied IP Address
+#   CONNECTIONTYPE          type of connection: wired, wireless, vpn, or resnet
+#   DT                      time-zone corrected date/time string for incident
+#   DT_NUMERIC              non-digit stripped version of $DATETIME
+#   TARGET                  time of incident
+################################################################################
+setup() {
+    local ylw="$(color yellow)"
+    local red="$(color red)"
+    local rst="$(color reset)"
+
+    local buffer=$(printf "%-$((($(tput cols) - 24) / 2))s" " ")
+    local buffer=$(echo -e "${buffer// / }${ylw}")
+
+    clear
+    echo -e "\n"
+    echo -e "${buffer}########################${rst}"
+    echo -e "${buffer}#                      #${rst}"
+    echo -e "${buffer}#${rst}  ${red}DMCA 'Gon Get You!${rst}  ${ylw}#${rst}"
+    echo -e "${buffer}#                      #${rst}"
+    echo -e "${buffer}########################${rst}"
+    echo
+
+    if [[ -n "$DATETIME" ]]; then
+        DATE=$(echo "$DATETIME" | sed 's/^\([0-9\-]*\)[A-Z].*/\1/')
+        TIME=$(echo "$DATETIME" | sed 's/[0-9\-]*T\([0-9:]*\)[A-Z]$/\1/')
+    fi
+
+    # IP Address
+    while [[ ! $IP =~ ^[0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}$ ]]; do
+        echo
+        [[ -n "$IP" ]] && prompt error \
+            "Invalid IP Address, must be in 'xxx.xxx.xxx.xxx' format."
+        prompt input "External IP Address:\t" IP
+    done
+
+    # Port Number
+    while [[ ! $PORT =~ ^[0-9]{1,5}$ ]]; do
+        echo
+        [[ -n "$PORT" ]] && prompt error \
+            "Invalid Port, must be in 'xxxxx' format."
+        prompt input "External Port Number:\t" PORT
+    done
+
+    # Time of Incident
+    while [[ ! $TIME =~ ^[0-9]{2}[:][0-9]{2}[:][0-9]{2}$ ]]; do
+        echo
+        [[ -n "$TIME" ]] && prompt error \
+            "Invalid Time, must be in UTC time and 'HH:MM:SS' format."
+        prompt input "Time of Incident:\t" TIME
+    done
+
+    # Date of Incident
+    while [[ ! $DATE =~ ^[0-9]{4}[/\-][0-9]{2}[/\-][0-9]{2}$ ]]; do
+        echo
+        [[ -n "$DATE" ]] && prompt error \
+            "Invalid Date, must be in 'YYYY/MM/DD' or 'YYYY-MM-DD' format."
+        prompt input "Date of Incident:\t" DATE
+    done
+
+    # Connection Type
+    HOSTNAME="$(nslookup "$IP" | grep 'name =' | sed 's/.*name = \(.*\)\.$/\1/')"
+    [[ -z "$HOSTNAME" ]] && prompt exit "Invalid IP Address." 0
+    case "$HOSTNAME" in
+        *wireless*)     CONNECTION="Wireless";;
+        *vpn*)          CONNECTION="VPN";;
+        *resnet*)       CONNECTION="Resnet";;
+        *)              CONNECTION="Wired";;
+    esac
+
+    DT="$(date -d "$DATE $TIME UTC")"
+    DT_NUMERIC="$(date +"%Y%m%d%H%M%S" -d "$DT")"
+    TARGET="$(date +"%H:%M:%S" -d "$DT")"
+
+    prompt "Incident Specifics"
+    prompt status "External IP Address:\t" "$IP"
+    prompt status "External Port Number:\t" "$PORT"
+    prompt status "Time of Incident:\t\t" "$TIME"
+    prompt status "Date of Incident:\t\t" "$DATE"
+    prompt status "Hostname:\t\t\t" "$HOSTNAME"
+    prompt status "Connection Type:\t\t" "$CONNECTION"
+    prompt line
+}
+
+
+################################################################################
+# Function to set Values to be used when reading Palo Alto Logs
+#
+# Args:
+#   $1                      # of hours offset from event date/time
+# Values Set:
+#   pa_logname              path to log given adjusted incident date and time
+################################################################################
+setLogNamePA() {
+    local log_dt=$(date -d "$DT $1 hour 1 hour")
+    local log_dt_format=$(date +"%Y%m%d-%H:00" -d "$log_dt")
+    local log_dt_numeric=$(date +"%Y%m%d%H" -d "$log_dt")
+    local curr_log_dt_numeric=$(date +"%Y%m%d%H" -d "1 hour")
+
+    pa_logname=""
+    if [[ $log_dt_numeric -lt $curr_log_dt_numeric ]]; then
+        pa_logname="${PA_LOGDIR}/pa-upns-${log_dt_format}.gz"
+    elif [[ $log_dt_numeric -eq $curr_log_dt_numeric ]]; then
+        pa_logname="${PA_CURRLOG}"
+    fi
+}
+
+
+################################################################################
+# Function to set Value for DHCP Log Name
+#
+# Args:
+#   $1                      Date for log entry to read
+# Values Set:
+#   dhcp_logname            path to log given specific timeframe
+################################################################################
+setLogNameDHCP() {
+    local log_date=$(date -d "$1 1 day")
+    local log_date_format=$(date +"%Y%m%d" -d "$log_date")
+    local log_date_numeric=$(date +"%Y%m%d" -d "$log_date")
+    local curr_log_date_numeric=$(date +"%Y%m%d" -d "1 day")
+
+    dhcp_log_name=""
+    if [[ $log_date_numeric -lt $curr_log_date_numeric ]]; then
+        dhcp_logname="${DHCP_LOGDIR}/dhcp.log-${log_date_format}.gz"
+    elif [[ $log_date_numeric -eq $curr_log_date_numeric ]]; then
+        dhcp_logname="${DHCP_CURRLOG}"
+    fi
+}
+
+
+################################################################################
+# Function to set Value for VPN Log Name
+#
+# Args:
+#   $1                      Date for log entry to read
+# Values Set:
+#   vpn_logname             path to log given specific timeframe
+################################################################################
+setLogNameVPN() {
+    local log_dt=$(date -d "$1 1 day")
+    local log_date_format=$(date +"%Y%m%d" -d "$log_dt")
+    local log_date_numeric=$(date +"%Y%m%d" -d "$log_dt")
+    local curr_log_date_numeric=$(date +"%Y%m%d" -d "1 day")
+
+    vpn_logname=""
+    if [[ $log_date_numeric -lt $curr_log_date_numeric ]]; then
+        vpn_logname="${VPN_LOGDIR}/vpn.log-${log_date_format}.gz"
+    elif [[ $log_date_numeric -eq $curr_log_date_numeric ]]; then
+        vpn_logname="${VPN_CURRLOG}"
+    fi
+}
+
+
+################################################################################
+# Populates variables for a Palo Alto log entry
+#
+# Args:
+#   $1              the log entry
+# Values Set:
+#   entry_session_id    entry_subtype       entry_source_ip
+#   entry_username      entry_application   entry_dt
+#   entry_dt_numeric    entry_date          entry_time
+################################################################################
+setEntryFieldsPA() {
+    entry_session_id=$(echo "$1" | sed 's/.*SessionID=\([0-9]*\).*/\1/')
+    entry_subtype=$(echo "$1" | sed 's/.*Subtype=\([a-z]*\).*/\1/')
+    entry_source_ip=$(echo "$1" | sed 's/.*src=\([0-9]*\.[0-9]*\.[0-9]*\.[0-9]*\).*/\1/')
+    entry_username=$(echo "$1" | sed 's/.*SourceUser=\([a-zA-Z0-9._\-]*\).*/\1/')
+    entry_application=$(echo "$1" | sed 's/.*Application=\([a-zA-Z0-9._\-]*\).*/\1/')
+    entry_dt=$(date -d "$(echo "$1" | sed 's/^\([a-zA-Z]*[ ]*[0-9]*[ ]*[0-9:]*\) .*/\1/')")
+    entry_dt_numeric=$(date +"%Y%m%d%H%M%S" -d "$entry_dt")
+    entry_date=$(date +"%m/%d" -d "$entry_dt")
+    entry_time=$(date +"%H:%M:%S" -d "$entry_dt")
+}
+
+
+################################################################################
+# Populates variables for a DHCP log entry
+#
+# Args:
+#   $1              the log entry
+# Values Set:
+#   entry_mac_address
+#   entry_dt    entry_dt_numeric    entry_date      entry_time
+################################################################################
+setEntryFieldsDHCP() {
+    entry_mac_address=$(echo "$1" | sed 's/.*uid 01:\(.*\)$/\1/')
+    entry_dt=$(date -d "$(echo "$1" | sed 's/^\([a-zA-Z]*[ ]*[0-9]*[ ]*[0-9:]*\) .*/\1/')")
+    entry_dt_numeric=$(date +"%Y%m%d%H%M%S" -d "$entry_dt")
+    entry_date=$(date +"%m/%d" -d "$entry_dt")
+    entry_time=$(date +"%H:%M:%S" -d "$entry_dt")
+}
+
+
+################################################################################
+# Populates variables for a VPN log entry
+#
+# Args:
+#   $1              the log entry
+# Values Set:
+#   entry_username      entry_dt        entry_dt_numeric
+################################################################################
+setEntryFieldsVPN() {
+    entry_username=$(echo "$1" | sed 's/.*(\([a-zA-Z0-9.]*\))$/\1/')
+    entry_dt=$(date -d "$(echo "$1" | sed 's/^\([a-zA-Z]*[ ]*[0-9]*[ ]*[0-9:]*\) .*/\1/')")
+    entry_dt_numeric=$(date +"%Y%m%d%H%M%S" -d "$entry_dt")
+}
+
+
+################################################################################
+# Reads a file and returns an array of matching values given the supplied
+#   commands arguments.
+#
+# Args:
+#   $1              the file to read
+#   $2              the command to execute
+# Values Updated:
+#   entries         the array of matching log entries prior to this function
+# Values Set:
+#   entries         the array of matching log entries given the command
+################################################################################
+readFile() {
+    if [[ -z "$1" ]]; then
+        prompt notify "Skipping this time period."
+        return
+    fi
+    [[ ! -e "$1" ]] && prompt exit "Log File doesn't exist:\t${1}" 1
+
+    prompt status "Using Command:" "\t\t$2"
+
+    timer start
+    mapfile -t entries_tmp < <(eval "$2")
+    entries=("${entries[@]}" "${entries_tmp[@]}")
+    timer end
+}
+
+
+################################################################################
+# Function to read set of logs to gather evidence for a specific incident
+#
+# Values Set:
+#   entries         the array of matching log entries for a specific incident
+#   pa_backup_logname
+#                   the path to the backup log file
+################################################################################
+readLogsPA() {
+    local log_range=1
+    entries=()
+
+    if [[ -f "$pa_backup_logname" ]]; then
+        prompt "Reading Entries from backup log file."
+        mapfile -t entries < <(cat $pa_backup_logname)
+        return
+    fi
+
+    prompt "Reading Entries from Palo Alto log files."
+    for time_offset in $(seq "-$log_range" "$log_range"); do
+        setLogNamePA "$time_offset"
+        case "$CONNECTION" in
+            Wired)    port_type="srcPort=";;
+            Wireless) port_type="srcPostNATPort=";;
+            *)          port_type="Port=";;
+        esac
+        cmd="zgrep -e \"${IP}|\" ${pa_logname} | grep \"${port_type}${PORT}|\""
+        readFile "$pa_logname" "$cmd"
+    done
+}
+
+
+################################################################################
+# Prints entries from the parsed Palo Alto logs that matched the given search
+#   criteria, waits for user input to choose session that spans the time of
+#   incident with appropriate matching 'application' and 'username', if given
+# If a backup log file exists, entries will be read from there.
+#
+# Values Set:
+#   session_ids             array of session IDs for matching entries
+################################################################################
+printEntriesPA() {
+    local backup=0
+    local found=0
+    local table_format="\t%3s   %-5s   %-9s   %-13s   %-18s   %s   "
+    local entry_count=${#entries[@]}
+    session_ids=()
+
+    # Check if required to output matching entries to backup file
+    [[ -f "$pa_backup_logname" ]] && backup=1
+
+    [[ $entry_count -eq 0 ]] && prompt exit "No matching entries found. Exiting." 0
+
+    # Print Table Header
+    printf "$(color green)$(color ul_on)${table_format}$(color ul_off)$(color reset)\n" \
+        "#" "Date" "  Time" " Application" "    SessionID" "NetID"
+
+    for i in $(seq 0 $((entry_count - 1))); do
+        entry=${entries[$i]}
+        [[ -z "$entry" ]] && continue
+
+        setEntryFieldsPA "$entry"
+        if [[ $found -eq 0 && $entry_dt_numeric -gt $DT_NUMERIC ]]; then
+            found=1
+            printf "${table_format}\n" "" "" "$(color yellow)${TARGET}$(color reset)" "" "" ""
+        fi
+        printf "${table_format}\n" \
+            "$i" "${entry_date}" "${entry_time}" "${entry_application::13}" \
+            "${entry_session_id} (${entry_subtype})" "${entry_username}"
+
+        # Copy log file to backup file
+        [[ $backup -eq 0 ]] && echo $entry >> $pa_backup_logname
+
+        session_ids=(${session_ids[*]} ${entry_session_id})
+
+        # Option to break the print loop in the event there is an abnormal
+        #   number of entries matching the search
+        read -r -n1 -t .01 brk
+        [[ "$?" = "0" ]] && break
+    done
+    echo
+}
+
+
+################################################################################
+# Function that prints the start/end log entries matching the sessionID
+#   selected by the user as the correct session that covers the time of the
+#   incident
+#
+# Values Set:
+#   first/last          the first and last matching logs date/time, to be used
+#                           when reading DHCP logs
+#   username            the username from the PA log, if given
+################################################################################
+printLogsPA() {
+    first=
+    last=
+    mapfile -t entries < <(grep "$sid" "$pa_backup_logname")
+    local entry_count=${#entries[@]}
+
+    # Loop over and print entry logs from backup log
+    prompt "Palo Alto Log Results"
+    for i in $(seq 0 $((entry_count - 1))); do
+        entry=${entries[$i]}
+        [[ -z "$entry" ]] && continue
+        setEntryFieldsPA "$entry"
+        echo -e "$entry"
+
+        [[ -z "$first" ]] && first="$entry_dt"
+        last=$entry_dt
+        netid=$entry_username
+    done
+}
+
+
+################################################################################
+# Function to read raw DHCP logs and find matching entries given an internal IP
+#   address and a time period
+#
+# Values Set:
+#   entries             the array of matching log entries
+################################################################################
+readLogsDHCP() {
+    entries=()
+    curr=$(date +%Y%m%d -d "$first")
+    last=$(date +%Y%m%d -d "$last")
+
+    prompt "Reading Entries from DHCP log files."
+    while [[ $curr -lt $last ||  $curr -eq $last ]]; do
+        setLogNameDHCP "$curr"
+        cmd="zgrep $entry_source_ip $dhcp_logname"
+        readFile "$dhcp_logname" "$cmd"
+        curr=$(date +%Y%m%d -d "$curr 1 day")
+    done
+    echo
+}
+
+
+################################################################################
+# Function to read raw VPN logs and find matching entries given the VPN IP
+#   address and a timeframe for the event
+#
+# Values Set:
+#   entries             the array of matching log entries
+################################################################################
+readLogsVPN() {
+    local log_range=15
+    local skip=0
+    entries=()
+    first=$(date -d "$DT -${log_range} second")
+    last=$(date -d "$DT ${log_range} second")
+    curr=$first
+
+    prompt "Reading Entries from VPN log files.\n"
+    while true; do
+        setLogNameVPN "$curr"
+        local_log_date=$(date +"%H" -d "$curr")
+        cmd="zgrep \"${IP}/${PORT}\" $vpn_logname"
+        cmd="${cmd} | grep '^[a-zA-Z]* [1-3 ][0-9] ${local_log_date}:'"
+        readFile "$vpn_logname" "$cmd"
+        [[ "$(date +"%d" -d "$curr")" = "$(date +"%d" -d "$last")" ]] && break
+        curr=$last
+    done
+    echo
+}
+
+
+################################################################################
+# Function to print all entries from the matching DHCP logs that occur within
+#   a specified time range
+################################################################################
+printLogsDHCP() {
+    local time_range=2
+    first=$(date +%Y%m%d%H%M%S -d "$DT -${time_range} hour")
+    last=$(date +%Y%m%d%H%M%S -d "$DT ${time_range} hour")
+    entry_count=${#entries[@]}
+
+    [[ $entry_count -eq 0 ]] && prompt exit "No matching entries found. Exiting." 0
+
+    prompt "DHCP Log Results"
+    for i in $(seq 0 $((entry_count - 1))); do
+        local entry=${entries[$i]}
+        [[ -z "$entry" ]] && continue
+        setEntryFieldsDHCP "$entry"
+        [[ $first -lt $entry_dt_numeric ]] && echo "$entry"
+        [[ $last -lt $entry_dt_numeric ]] && break
+    done
+    mac_addr="$entry_mac_address"
+    netid="$entry_username"
+}
+
+
+################################################################################
+# Function to print all entries from the matching VPN logs that occur within a
+#   specifiec time range
+################################################################################
+printLogsVPN() {
+    local time_range=10
+    first=$(date +%Y%m%d%H%M%S -d "$DT -${time_range} second")
+    last=$(date +%Y%m%d%H%M%S -d "$DT ${time_range} second")
+    entry_count=${#entries[@]}
+
+    [[ $entry_count -eq 0 ]] && prompt exit "No matching entries found. Exiting." 0
+
+    prompt "VPN Log Results"
+    for i in $(seq 0 $((entry_count - 1))); do
+        local entry=${entries[$i]}
+        [[ -z "$entry" ]] && continue
+        setEntryFieldsVPN "$entry"
+        if [[ -z "$netid" ]]; then
+            netid="$entry_username"
+        elif [[ "$netid" != "$entry_username" ]]; then
+            netid="Multiple"
+        fi
+        [[ $first -lt $entry_dt_numeric ]] && echo "$entry"
+        [[ $last -lt $entry_dt_numeric ]] && break
+    done
+    [[ "$netid" = "Multiple" ]] && netid=""
+}
+
+
+################################################################################
+# Common Function to process an event that would be logged using the Palo Altos
+################################################################################
+paConnection() {
+    pa_backup_logname="${BACKUP_LOGDIR}/pa_${DT_NUMERIC}_${IP}_${PORT}.log"
+
+    if [[ "$CLR" = "1" && -f "$pa_backup_logname" ]]; then
+        rm "$pa_backup_logname"
+        prompt status "Clearing the backup file: " "$pa_backup_logname"
+        echo
+    fi
+
+    readLogsPA
+    printEntriesPA
+
+    local sid=
+    while [[ -z "$sid" ]]; do
+        prompt input "Select an entry #: " e #&& read e
+        [[ -z "$e" ]] && prompt exit "No entry # entered. Exiting." 1
+        [[ $e -lt ${#session_ids[@]} ]] && sid=${session_ids[$e]}
+    done
+
+    prompt line
+    printLogsPA                 # Print Matching PA Entries for given SessionID
+    prompt line
+
+    readLogsDHCP                # Read DHCP Logs with data from selected session
+    printLogsDHCP               # Print Matching DHCP Entries
+    prompt line
+}
+
+
+################################################################################
+# Common Function to process an event that utilized VPN
+################################################################################
+vpnConnection() {
+    readLogsVPN                 # Read VPN Logs with given IP/Date/Port
+    prompt line
+    printLogsVPN                # Print Matching VPN Entries
+    prompt line
+}
+
+
+################################################################################
+# Common Function to process an event that occured using Resnet
+################################################################################
+resnetConnection() {
+    prompt notify \
+        "Unable to process Resnet connections."
+    prompt notify \
+        "Must use the Warehouse to process this report.\n\t\t${RESNET_URL}"
+    echo
+    exit 0
+}
+
+
+################################################################################
+# Main Function
+################################################################################
+main() {
+    # Make the backup directory if it does not exist already
+    [[ -d "$BACKUP_LOGDIR" ]] || mkdir "$BACKUP_LOGDIR"
+
+    # Parse the arguments
+    while [[ -n "$1" ]]; do
+        case "$1" in
+            -ip)        IP="$2"; shift;;
+            -port)      PORT="$2"; shift;;
+            -date)      DATE="$2"; shift;;
+            -time)      TIME="$2"; shift;;
+            -datetime)  DATETIME="$2"; shift;;
+            -clear)     CLR="1";;
+            -help|-h)   support;;
+            *)      prompt exit "Invalid Argument: $1" 1;;
+        esac
+        shift
+    done
+
+    # Populate Global Variables
+    setup
+
+    # Perform log parsing/printing
+    case "$CONNECTION" in
+        Wired|Wireless) paConnection;;
+        VPN)              vpnConnection;;
+        Resnet)           resnetConnection;;
+    esac
+
+    # Print associated users NetID, if it existed in logs
+    if [[ -n "$netid" ]]; then
+        prompt status "NetID:\t\t\t" "$netid"
+        prompt status "MAC Address:\t\t" "$mac_addr"
+        echo
+        if [[ "$CONNECTION" = "Wired" || "$CONNECTION" = "Wireless" ]]; then
+            prompt notify \
+                "Must use Cisco Prime to validate the NetID with MAC address.\n\t\t${CISCOPRIME_URL}"
+        fi
+    fi
+    echo
+    prompt notify "Done!\n"
+}
+
+
+################################################################################
+# Do ittttttttttttttt
+################################################################################
+# Verify Script was executed correctly in sub-shell
+[[ "$0" = "-bash" ]] && support
+
+main $*
+exit 0
